@@ -35,36 +35,6 @@ export interface PubsubMessage extends google.pubsub.v1.IPubsubMessage {
    * @private
    */
   calculatedSize?: number;
-
-  // The following are here instead of inside an object (like subs) because we
-  // don't get to control what these objects are. They come from grpc.
-}
-
-/**
- * Since we tag a fair number of extra things into messages sent to the Pub/Sub
- * server, this filters everything down to what needs to be sent. This should be
- * used right before gRPC calls.
- */
-export function filterMessage(
-  message: PubsubMessage
-): google.pubsub.v1.IPubsubMessage {
-  const filtered = {} as PubsubMessage;
-  if (message.data) {
-    filtered.data = message.data;
-  }
-  if (message.attributes) {
-    filtered.attributes = message.attributes;
-  }
-  if (message.messageId) {
-    filtered.messageId = message.messageId;
-  }
-  if (message.publishTime) {
-    filtered.publishTime = message.publishTime;
-  }
-  if (message.orderingKey) {
-    filtered.orderingKey = message.orderingKey;
-  }
-  return filtered;
 }
 
 /**

@@ -103,7 +103,6 @@ export class Message {
   private _handled: boolean;
   private _length: number;
   private _subscriber: Subscriber;
-
   private _ackFailed?: AckError;
 
   /**
