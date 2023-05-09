@@ -35,15 +35,6 @@ export type SetPolicyResponse = [Policy];
 export type GetPolicyResponse = [Policy];
 
 /**
- * Allows us to get the most up to date full name of an object.
- *
- * @private
- */
-export interface Nameable {
-  name: string;
-}
-
-/**
  * Shows which IAM permissions is allowed.
  * The key to this object are the IAM permissions (string) and the values are
  * booleans, true if permissions are granted to the corresponding key.
@@ -104,22 +95,12 @@ export type TestIamPermissionsCallback = ResourceCallback<
 export class IAM {
   pubsub: PubSub;
   request: typeof PubSub.prototype.request;
-  private nameable_: Nameable;
+  id: string;
 
-  constructor(pubsub: PubSub, nameOrNameable: Nameable | string) {
+  constructor(pubsub: PubSub, id: string) {
     this.pubsub = pubsub;
     this.request = pubsub.request.bind(pubsub);
-    if (typeof nameOrNameable === 'string') {
-      this.nameable_ = {
-        name: nameOrNameable,
-      };
-    } else {
-      this.nameable_ = nameOrNameable;
-    }
-  }
-
-  get id(): string {
-    return this.nameable_.name;
+    this.id = id;
   }
 
   /**

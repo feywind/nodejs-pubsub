@@ -28,12 +28,13 @@ import {google} from '../protos/protos';
 import * as defer from 'p-defer';
 
 import {HistogramOptions} from '../src/histogram';
-import {FlowControlOptions, LeaseManager} from '../src/lease-manager';
+import {FlowControlOptions} from '../src/lease-manager';
 import {BatchOptions} from '../src/message-queues';
 import {MessageStreamOptions} from '../src/message-stream';
 import * as s from '../src/subscriber';
 import {Subscription} from '../src/subscription';
 import {SpanKind} from '@opentelemetry/api';
+import {SemanticAttributes} from '@opentelemetry/semantic-conventions';
 import {Duration} from '../src';
 
 type PullResponse = google.pubsub.v1.IStreamingPullResponse;
@@ -61,10 +62,6 @@ class FakeSubscription {
   name = uuid.v4();
   projectId = uuid.v4();
   pubsub = new FakePubSub();
-}
-
-interface PublicInventory {
-  _inventory: LeaseManager;
 }
 
 class FakeHistogram {
@@ -759,8 +756,6 @@ describe('Subscriber', () => {
     });
 
     it('should add messages to the inventory', done => {
-      const message = new Message(subscriber, RECEIVED_MESSAGE);
-
       subscriber.open();
 
       const modAckStub = sandbox.stub(subscriber, 'modAck');
@@ -771,15 +766,6 @@ describe('Subscriber', () => {
       const inventory: FakeLeaseManager = stubs.get('inventory');
       const addStub = sandbox.stub(inventory, 'add').callsFake(() => {
         const [addMsg] = addStub.lastCall.args;
-
-        // OTel is enabled during tests, so we need to delete the baggage.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const [addMsgAny, msgAny] = [addMsg as any, message as any];
-        delete addMsgAny.telemetrySpan;
-        delete addMsgAny.telemetrySub;
-        delete msgAny.telemetrySpan;
-        delete msgAny.telemetrySub;
-
         assert.deepStrictEqual(addMsg, message);
 
         // test for receipt
@@ -864,31 +850,31 @@ describe('Subscriber', () => {
 
     it('should not instantiate a tracer when tracing is disabled', () => {
       subscriber = new Subscriber(subscription, {});
-      assert.strictEqual(subscriber['_useLegacyOpenTelemetry'], false);
+      assert.strictEqual(subscriber['_useOpentelemetry'], false);
     });
 
     it('should instantiate a tracer when tracing is enabled through constructor', () => {
       subscriber = new Subscriber(subscription, enableTracing);
-      assert.ok(subscriber['_useLegacyOpenTelemetry']);
+      assert.ok(subscriber['_useOpentelemetry']);
     });
 
     it('should instantiate a tracer when tracing is enabled through setOptions', () => {
       subscriber = new Subscriber(subscription, {});
       subscriber.setOptions(enableTracing);
-      assert.ok(subscriber['_useLegacyOpenTelemetry']);
+      assert.ok(subscriber['_useOpentelemetry']);
     });
 
     it('should disable tracing when tracing is disabled through setOptions', () => {
       subscriber = new Subscriber(subscription, enableTracing);
       subscriber.setOptions(disableTracing);
-      assert.strictEqual(subscriber['_useLegacyOpenTelemetry'], false);
+      assert.strictEqual(subscriber['_useOpentelemetry'], false);
     });
 
     it('exports a span once it is created', () => {
       subscription = new FakeSubscription() as {} as Subscription;
       subscriber = new Subscriber(subscription, enableTracing);
       message = new Message(subscriber, RECEIVED_MESSAGE);
-      assert.strictEqual(subscriber['_useLegacyOpenTelemetry'], true);
+      assert.strictEqual(subscriber['_useOpentelemetry'], true);
       subscriber.open();
 
       // Construct mock of received message with span context
@@ -914,25 +900,18 @@ describe('Subscriber', () => {
         receivedMessages: [messageWithSpanContext],
       };
 
-      const openedSub = subscriber as unknown as PublicInventory;
-      sandbox.stub(openedSub._inventory, 'add').callsFake((m: s.Message) => {
-        message = m;
-      });
-
       // Receive message and assert that it was exported
       const msgStream = stubs.get('messageStream');
       msgStream.emit('data', pullResponse);
 
-      message.endTelemetrySpan();
-
       const spans = exporter.getFinishedSpans();
-      assert.strictEqual(spans.length, 2);
-      const firstSpan = spans.pop();
+      assert.strictEqual(spans.length, 1);
+      const firstSpan = spans.concat().shift();
       assert.ok(firstSpan);
       assert.strictEqual(firstSpan.parentSpanId, parentSpanContext.spanId);
       assert.strictEqual(
         firstSpan.name,
-        `${subscriber.name} receive`,
+        `${subscriber.name} process`,
         'name of span should match'
       );
       assert.strictEqual(
@@ -940,27 +919,42 @@ describe('Subscriber', () => {
         SpanKind.CONSUMER,
         'span kind should be CONSUMER'
       );
+      assert.strictEqual(
+        firstSpan.attributes[SemanticAttributes.MESSAGING_OPERATION],
+        'process',
+        'span messaging operation should match'
+      );
+      assert.strictEqual(
+        firstSpan.attributes[SemanticAttributes.MESSAGING_SYSTEM],
+        'pubsub'
+      );
+      assert.strictEqual(
+        firstSpan.attributes[SemanticAttributes.MESSAGING_MESSAGE_ID],
+        messageWithSpanContext.message.messageId,
+        'span messaging id should match'
+      );
+      assert.strictEqual(
+        firstSpan.attributes[SemanticAttributes.MESSAGING_DESTINATION],
+        subscriber.name,
+        'span messaging destination should match'
+      );
+      assert.strictEqual(
+        firstSpan.attributes[SemanticAttributes.MESSAGING_DESTINATION_KIND],
+        'topic'
+      );
     });
 
-    it('exports a span even when a span context is not present on message', () => {
+    it('does not export a span when a span context is not present on message', () => {
       subscriber = new Subscriber(subscription, enableTracing);
-      subscriber.open();
 
       const pullResponse: s.PullResponse = {
         receivedMessages: [RECEIVED_MESSAGE],
       };
 
-      const openedSub = subscriber as unknown as PublicInventory;
-      sandbox.stub(openedSub._inventory, 'add').callsFake((m: s.Message) => {
-        message = m;
-      });
-
       // Receive message and assert that it was exported
       const stream: FakeMessageStream = stubs.get('messageStream');
       stream.emit('data', pullResponse);
-
-      message.endTelemetrySpan();
-      assert.strictEqual(exporter.getFinishedSpans().length, 2);
+      assert.strictEqual(exporter.getFinishedSpans().length, 0);
     });
   });
 

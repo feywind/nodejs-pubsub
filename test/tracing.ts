@@ -18,7 +18,7 @@ import {
   BasicTracerProvider,
   InMemorySpanExporter,
   SimpleSpanProcessor,
-} from '@opentelemetry/sdk-trace-base';
+} from '@opentelemetry/tracing';
 
 /**
  * This file is used to initialise a global tracing provider and span exporter

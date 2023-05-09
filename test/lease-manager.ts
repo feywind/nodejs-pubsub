@@ -47,22 +47,9 @@ class FakeSubscriber extends EventEmitter {
   isExactlyOnceDelivery = false;
 }
 
-class FakeSubscriberTelemetry {
-  flowStart() {}
-  flowEnd() {}
-  schedulerStart() {}
-  schedulerEnd() {}
-  modAckStart() {}
-  modAckStop() {}
-  processingStart() {}
-  processingEnd() {}
-}
-
 class FakeMessage {
   length = 20;
   received: number;
-  telemetrySub: FakeSubscriberTelemetry = new FakeSubscriberTelemetry();
-
   constructor() {
     this.received = Date.now();
   }
@@ -71,7 +58,6 @@ class FakeMessage {
     return AckResponses.Success;
   }
   ackFailed() {}
-  endTelemetrySpan() {}
 }
 
 interface LeaseManagerInternals {

@@ -15,9 +15,8 @@
  */
 
 import {EventEmitter} from 'events';
-import {AckError, Message, Subscriber} from './subscriber';
+import {Message, Subscriber} from './subscriber';
 import {defaultOptions} from './default-options';
-import {Duration} from './temporal';
 
 export interface FlowControlOptions {
   allowExcessMessages?: boolean;
@@ -105,8 +104,6 @@ export class LeaseManager extends EventEmitter {
     this._messages.add(message);
     this.bytes += message.length;
 
-    message.telemetrySub.flowStart();
-
     if (allowExcessMessages! || !wasFull) {
       this._dispense(message);
     } else {
@@ -159,9 +156,6 @@ export class LeaseManager extends EventEmitter {
    * @private
    */
   remove(message: Message): void {
-    // The subscriber span ends when it leaves leasing.
-    message.endTelemetrySpan();
-
     if (!this._messages.has(message)) {
       return;
     }
@@ -246,10 +240,7 @@ export class LeaseManager extends EventEmitter {
    */
   private _dispense(message: Message): void {
     if (this._subscriber.isOpen) {
-      message.telemetrySub.flowEnd();
-      process.nextTick(() => {
-        this._subscriber.emit('message', message);
-      });
+      process.nextTick(() => this._subscriber.emit('message', message));
     }
   }
   /**
@@ -266,27 +257,7 @@ export class LeaseManager extends EventEmitter {
       const lifespan = (Date.now() - message.received) / (60 * 1000);
 
       if (lifespan < this._options.maxExtensionMinutes!) {
-        message.telemetrySub.modAckStart(
-          Duration.from({seconds: deadline}),
-          false
-        );
-
-        if (this._subscriber.isExactlyOnceDelivery) {
-          message
-            .modAckWithResponse(deadline)
-            .catch(e => {
-              // In the case of a permanent failure (temporary failures are retried),
-              // we need to stop trying to lease-manage the message.
-              message.ackFailed(e as AckError);
-              this.remove(message);
-            })
-            .finally(() => {
-              message.telemetrySub.modAckStop();
-            });
-        } else {
-          message.modAck(deadline);
-          message.telemetrySub.modAckStop();
-        }
+        message.modAck(deadline);
       } else {
         this.remove(message);
       }

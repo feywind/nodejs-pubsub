@@ -15,7 +15,6 @@
  */
 
 import {google} from '../../protos/protos';
-import * as tracing from '../telemetry-tracing';
 
 /**
  * Strings are the only allowed values for keys and values in message attributes.
@@ -25,9 +24,7 @@ export type Attributes = Record<string, string>;
 /**
  * The basic {data, attributes} for a message to be published.
  */
-export interface PubsubMessage
-  extends google.pubsub.v1.IPubsubMessage,
-    tracing.MessageWithAttributes {
+export interface PubsubMessage extends google.pubsub.v1.IPubsubMessage {
   /**
    * If we've calculated the size of this message, it will be cached here.
    * This is done to avoid having to build up the attribute size over and over.
@@ -41,20 +38,6 @@ export interface PubsubMessage
 
   // The following are here instead of inside an object (like subs) because we
   // don't get to control what these objects are. They come from grpc.
-
-  /**
-   * If telemetry is enabled, track the batch span.
-   *
-   * @private
-   */
-  telemetryBatching?: tracing.Span;
-
-  /**
-   * If telemetry is enabled, track the RPC send time span.
-   *
-   * @private
-   */
-  telemetryRpc?: tracing.Span;
 }
 
 /**

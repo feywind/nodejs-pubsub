@@ -17,6 +17,9 @@
 import {DateStruct, PreciseDate} from '@google-cloud/precise-date';
 import {replaceProjectIdToken} from '@google-cloud/projectify';
 import {promisify} from '@google-cloud/promisify';
+import {EventEmitter} from 'events';
+import {SpanContext, Span, SpanKind} from '@opentelemetry/api';
+import {SemanticAttributes} from '@opentelemetry/semantic-conventions';
 
 import {google} from '../protos/protos';
 import {Histogram} from './histogram';
@@ -26,9 +29,8 @@ import {MessageStream, MessageStreamOptions} from './message-stream';
 import {Subscription} from './subscription';
 import {defaultOptions} from './default-options';
 import {SubscriberClient} from './v1';
-import * as tracing from './telemetry-tracing';
+import {createSpan} from './opentelemetry-tracing';
 import {Duration} from './temporal';
-import {EventEmitter} from 'events';
 
 export type PullResponse = google.pubsub.v1.IStreamingPullResponse;
 export type SubscriptionProperties =
@@ -63,100 +65,6 @@ export class AckError extends Error {
 }
 
 /**
- * Tracks the various spans in receive telemetry. This is a little
- * extra abstraction in case we want to allow more providers later.
- *
- * @private
- */
-export class SubscriberTelemetry {
-  parent: Message;
-  sub: Subscriber;
-
-  // These are always attached to a message (and its subscriber).
-  constructor(parent: Message, sub: Subscriber) {
-    this.parent = parent;
-    this.sub = sub;
-  }
-
-  // Start a flow control span if needed.
-  flowStart() {
-    if (!this.flow) {
-      this.flow = tracing.SpanMaker.createReceiveFlowSpan(this.parent);
-    }
-  }
-
-  // End any flow control span.
-  flowEnd() {
-    if (this.flow) {
-      this.flow.end();
-      this.flow = undefined;
-    }
-  }
-
-  // Start a leasing modAck span if needed.
-  modAckStart(deadline: Duration, isInitial: boolean) {
-    if (!this.modAck) {
-      this.modAck = tracing.SpanMaker.createModAckSpan(
-        this.parent,
-        deadline,
-        isInitial
-      );
-    }
-  }
-
-  // End any leasing modAck span.
-  modAckStop() {
-    if (this.modAck) {
-      this.modAck.end();
-      this.modAck = undefined;
-    }
-  }
-
-  // Start a scheduler span if needed.
-  // Note: This is not currently used in Node, because there is no
-  // scheduler process, due to the way messages are delivered one at a time.
-  schedulerStart() {
-    if (!this.scheduler) {
-      this.scheduler = tracing.SpanMaker.createReceiveSchedulerSpan(
-        this.parent
-      );
-    }
-  }
-
-  // End any schedular span.
-  schedulerEnd() {
-    if (this.scheduler) {
-      this.scheduler.end();
-      this.scheduler = undefined;
-    }
-  }
-
-  // Start a processing span if needed.
-  // This is for user processing, during on('message') delivery.
-  processingStart(subName: string) {
-    if (!this.processing) {
-      this.processing = tracing.SpanMaker.createReceiveProcessSpan(
-        this.parent,
-        subName
-      );
-    }
-  }
-
-  // End any processing span.
-  processingEnd() {
-    if (this.processing) {
-      this.processing.end();
-      this.processing = undefined;
-    }
-  }
-
-  private modAck?: tracing.Span;
-  private flow?: tracing.Span;
-  private scheduler?: tracing.Span;
-  private processing?: tracing.Span;
-}
-
-/**
  * Date object with nanosecond precision. Supports all standard Date arguments
  * in addition to several custom types.
  *
@@ -183,7 +91,7 @@ export class SubscriberTelemetry {
  * });
  * ```
  */
-export class Message implements tracing.MessageWithAttributes {
+export class Message {
   ackId: string;
   attributes: {[key: string]: string};
   data: Buffer;
@@ -195,35 +103,6 @@ export class Message implements tracing.MessageWithAttributes {
   private _handled: boolean;
   private _length: number;
   private _subscriber: Subscriber;
-
-  /**
-   * @private
-   *
-   * Tracks any telemetry span through the library, on the receive side. This will
-   * be the original publisher-side span if we have one.
-   *
-   * This needs to be declared explicitly here, because having a public class
-   * implement a private interface seems to confuse TypeScript. (And it's needed
-   * in unit tests.)
-   */
-  telemetrySpan?: tracing.Span;
-
-  /**
-   * @private
-   *
-   * Ends any open subscribe telemetry span.
-   */
-  endTelemetrySpan() {
-    this.telemetrySpan?.end();
-    delete this.telemetrySpan;
-  }
-
-  /**
-   * @private
-   *
-   * Tracks subscriber-specific telemetry spans through the library.
-   */
-  telemetrySub: SubscriberTelemetry;
 
   private _ackFailed?: AckError;
 
@@ -303,13 +182,6 @@ export class Message implements tracing.MessageWithAttributes {
      * @type {number}
      */
     this.received = Date.now();
-
-    /**
-     * Telemetry tracking objects.
-     *
-     * @private
-     */
-    this.telemetrySub = new SubscriberTelemetry(this, sub);
 
     this._handled = false;
     this._length = this.data.length;
@@ -509,8 +381,6 @@ export interface SubscriberOptions {
   flowControl?: FlowControlOptions;
   useLegacyFlowControl?: boolean;
   streamingOptions?: MessageStreamOptions;
-
-  /** @deprecated Unset and use context propagation. */
   enableOpenTelemetryTracing?: boolean;
 }
 
@@ -534,7 +404,7 @@ export class Subscriber extends EventEmitter {
   private _acks!: AckQueue;
   private _histogram: Histogram;
   private _inventory!: LeaseManager;
-  private _useLegacyOpenTelemetry: boolean;
+  private _useOpentelemetry: boolean;
   private _latencies: Histogram;
   private _modAcks!: ModAckQueue;
   private _name!: string;
@@ -552,7 +422,7 @@ export class Subscriber extends EventEmitter {
     this.maxBytes = defaultOptions.subscription.maxOutstandingBytes;
     this.useLegacyFlowControl = false;
     this.isOpen = false;
-    this._useLegacyOpenTelemetry = false;
+    this._useOpentelemetry = false;
     this._histogram = new Histogram({min: 10, max: 600});
     this._latencies = new Histogram();
     this._subscription = subscription;
@@ -696,17 +566,12 @@ export class Subscriber extends EventEmitter {
     const ackTimeSeconds = (Date.now() - message.received) / 1000;
     this.updateAckDeadline(ackTimeSeconds);
 
-    const ackSpan = tracing.SpanMaker.createReceiveResponseSpan(message, true);
-
     // Ignore this in this version of the method (but hook catch
     // to avoid unhandled exceptions).
     const resultPromise = this._acks.add(message);
     resultPromise.catch(() => {});
 
     await this._acks.onFlush();
-
-    ackSpan?.end();
-
     this._inventory.remove(message);
   }
 
@@ -722,12 +587,7 @@ export class Subscriber extends EventEmitter {
     const ackTimeSeconds = (Date.now() - message.received) / 1000;
     this.updateAckDeadline(ackTimeSeconds);
 
-    const ackSpan = tracing.SpanMaker.createReceiveResponseSpan(message, true);
-
     await this._acks.add(message);
-
-    ackSpan?.end();
-
     this._inventory.remove(message);
 
     // No exception means Success.
@@ -826,12 +686,7 @@ export class Subscriber extends EventEmitter {
    * @private
    */
   async nack(message: Message): Promise<void> {
-    const ackSpan = tracing.SpanMaker.createReceiveResponseSpan(message, false);
-
     await this.modAck(message, 0);
-
-    ackSpan?.end();
-
     this._inventory.remove(message);
   }
 
@@ -845,10 +700,7 @@ export class Subscriber extends EventEmitter {
    * @private
    */
   async nackWithResponse(message: Message): Promise<AckResponse> {
-    const ackSpan = tracing.SpanMaker.createReceiveResponseSpan(message, false);
-    const response = await this.modAckWithResponse(message, 0);
-    ackSpan?.end();
-    return response;
+    return await this.modAckWithResponse(message, 0);
   }
 
   /**
@@ -890,7 +742,7 @@ export class Subscriber extends EventEmitter {
   setOptions(options: SubscriberOptions): void {
     this._options = options;
 
-    this._useLegacyOpenTelemetry = options.enableOpenTelemetryTracing || false;
+    this._useOpentelemetry = options.enableOpenTelemetryTracing || false;
 
     // The user-set ackDeadline value basically pegs the extension time.
     // We'll emulate it by overwriting min/max.
@@ -928,18 +780,58 @@ export class Subscriber extends EventEmitter {
   }
 
   /**
-   * Constructs a telemetry span from the incoming message.
+   * Constructs an OpenTelemetry span from the incoming message.
    *
    * @param {Message} message One of the received messages
    * @private
    */
-  private createParentSpan(message: Message): void {
-    const enabled = tracing.isEnabled({
-      enableOpenTelemetryTracing: this._useLegacyOpenTelemetry,
-    });
-    if (enabled) {
-      tracing.extractSpan(message, this.name, enabled);
+  private _constructSpan(message: Message): Span | undefined {
+    // Handle cases where OpenTelemetry is disabled or no span context was sent through message
+    if (
+      !this._useOpentelemetry ||
+      !message.attributes ||
+      !message.attributes['googclient_OpenTelemetrySpanContext']
+    ) {
+      return undefined;
     }
+
+    const spanValue = message.attributes['googclient_OpenTelemetrySpanContext'];
+    const parentSpanContext: SpanContext | undefined = spanValue
+      ? JSON.parse(spanValue)
+      : undefined;
+    const spanAttributes = {
+      // Original span attributes
+      ackId: message.ackId,
+      deliveryAttempt: message.deliveryAttempt,
+      //
+      // based on https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/trace/semantic_conventions/messaging.md#topic-with-multiple-consumers
+      [SemanticAttributes.MESSAGING_SYSTEM]: 'pubsub',
+      [SemanticAttributes.MESSAGING_OPERATION]: 'process',
+      [SemanticAttributes.MESSAGING_DESTINATION]: this.name,
+      [SemanticAttributes.MESSAGING_DESTINATION_KIND]: 'topic',
+      [SemanticAttributes.MESSAGING_MESSAGE_ID]: message.id,
+      [SemanticAttributes.MESSAGING_PROTOCOL]: 'pubsub',
+      [SemanticAttributes.MESSAGING_MESSAGE_PAYLOAD_SIZE_BYTES]: (
+        message.data as Buffer
+      ).length,
+      // Not in Opentelemetry semantic convention but mimics naming
+      'messaging.pubsub.received_at': message.received,
+      'messaging.pubsub.acknowlege_id': message.ackId,
+      'messaging.pubsub.delivery_attempt': message.deliveryAttempt,
+    };
+
+    // Subscriber spans should always have a publisher span as a parent.
+    // Return undefined if no parent is provided
+    const spanName = `${this.name} process`;
+    const span = parentSpanContext
+      ? createSpan(
+          spanName.trim(),
+          SpanKind.CONSUMER,
+          spanAttributes,
+          parentSpanContext
+        )
+      : undefined;
+    return span;
   }
 
   /**
@@ -969,16 +861,12 @@ export class Subscriber extends EventEmitter {
     for (const data of receivedMessages!) {
       const message = new Message(this, data);
 
-      this.createParentSpan(message);
+      const span: Span | undefined = this._constructSpan(message);
 
       if (this.isOpen) {
         if (this.isExactlyOnceDelivery) {
           // For exactly-once delivery, we must validate that we got a valid
           // lease on the message before actually leasing it.
-          message.telemetrySub.modAckStart(
-            Duration.from({seconds: this.ackDeadline}),
-            true
-          );
           message
             .modAckWithResponse(this.ackDeadline)
             .then(() => {
@@ -988,21 +876,16 @@ export class Subscriber extends EventEmitter {
               // Temporary failures will retry, so if an error reaches us
               // here, that means a permanent failure. Silently drop these.
               this._discardMessage(message);
-            })
-            .finally(() => {
-              message.telemetrySub.modAckStop();
             });
         } else {
-          message.telemetrySub.modAckStart(
-            Duration.from({seconds: this.ackDeadline}),
-            true
-          );
           message.modAck(this.ackDeadline);
-          message.telemetrySub.modAckStop();
           this._inventory.add(message);
         }
       } else {
         message.nack();
+      }
+      if (span) {
+        span.end();
       }
     }
   }

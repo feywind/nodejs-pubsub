@@ -14,16 +14,18 @@
  * limitations under the License.
  */
 
+import {promisify} from '@google-cloud/promisify';
 import * as extend from 'extend';
 import {CallOptions} from 'google-gax';
-import {isSpanContextValid, Span} from '@opentelemetry/api';
+import {SemanticAttributes} from '@opentelemetry/semantic-conventions';
+import {isSpanContextValid, Span, SpanKind} from '@opentelemetry/api';
 
 import {BatchPublishOptions} from './message-batch';
 import {Queue, OrderedQueue} from './message-queues';
 import {Topic} from '../topic';
 import {RequestCallback, EmptyCallback} from '../pubsub';
 import {defaultOptions} from '../default-options';
-import * as tracing from '../telemetry-tracing';
+import {createSpan} from '../opentelemetry-tracing';
 
 import {FlowControl, FlowControlOptions} from './flow-control';
 import {promisifySome} from '../util';
@@ -38,8 +40,6 @@ export interface PublishOptions {
   flowControlOptions?: FlowControlOptions;
   gaxOpts?: CallOptions;
   messageOrdering?: boolean;
-
-  /** @deprecated Unset and use context propagation. */
   enableOpenTelemetryTracing?: boolean;
 }
 
@@ -123,12 +123,14 @@ export class Publisher {
               // event listeners after we've completed flush().
               q.removeListener('drain', flushResolver);
             };
-            q.on('drain', flushResolver);
+            return q.on('drain', flushResolver);
           })
       )
     );
 
-    const allPublishes = Promise.all(toDrain.map(q => q.publishDrain()));
+    const allPublishes = Promise.all(
+      toDrain.map(q => promisify(q.publishDrain).bind(q)())
+    );
 
     allPublishes
       .then(() => allDrains)
@@ -209,23 +211,29 @@ export class Publisher {
       }
     }
 
-    // Ensure that there's a parent span for subsequent publishes
-    // to hang off of.
-    this.getParentSpan(message);
+    const span: Span | undefined = this.constructSpan(message);
 
     if (!message.orderingKey) {
       this.queue.add(message, callback!);
-    } else {
-      const key = message.orderingKey;
-
-      if (!this.orderedQueues.has(key)) {
-        const queue = new OrderedQueue(this, key);
-        this.orderedQueues.set(key, queue);
-        queue.once('drain', () => this.orderedQueues.delete(key));
+      if (span) {
+        span.end();
       }
+      return;
+    }
 
-      const queue = this.orderedQueues.get(key)!;
-      queue.add(message, callback!);
+    const key = message.orderingKey;
+
+    if (!this.orderedQueues.has(key)) {
+      const queue = new OrderedQueue(this, key);
+      this.orderedQueues.set(key, queue);
+      queue.once('drain', () => this.orderedQueues.delete(key));
+    }
+
+    const queue = this.orderedQueues.get(key)!;
+    queue.add(message, callback!);
+
+    if (span) {
+      span.end();
     }
   }
 
@@ -326,30 +334,54 @@ export class Publisher {
   }
 
   /**
-   * Finds or constructs an telemetry publish/parent span for a message.
+   * Constructs an OpenTelemetry span
    *
    * @private
    *
    * @param {PubsubMessage} message The message to create a span for
    */
-  getParentSpan(message: PubsubMessage): Span | undefined {
-    const enabled = tracing.isEnabled(this.settings);
-    if (!enabled) {
+  constructSpan(message: PubsubMessage): Span | undefined {
+    if (!this.settings.enableOpenTelemetryTracing) {
       return undefined;
     }
 
-    if (message.telemetrySpan) {
-      return message.telemetrySpan;
-    }
+    const spanAttributes = {
+      // Add Opentelemetry semantic convention attributes to the span, based on:
+      // https://github.com/open-telemetry/opentelemetry-specification/blob/v1.1.0/specification/trace/semantic_conventions/messaging.md
+      [SemanticAttributes.MESSAGING_TEMP_DESTINATION]: false,
+      [SemanticAttributes.MESSAGING_SYSTEM]: 'pubsub',
+      [SemanticAttributes.MESSAGING_OPERATION]: 'send',
+      [SemanticAttributes.MESSAGING_DESTINATION]: this.topic.name,
+      [SemanticAttributes.MESSAGING_DESTINATION_KIND]: 'topic',
+      [SemanticAttributes.MESSAGING_MESSAGE_ID]: message.messageId,
+      [SemanticAttributes.MESSAGING_PROTOCOL]: 'pubsub',
+      [SemanticAttributes.MESSAGING_MESSAGE_PAYLOAD_SIZE_BYTES]:
+        message.data?.length,
+      'messaging.pubsub.ordering_key': message.orderingKey,
+    } as Attributes;
 
-    const span = tracing.SpanMaker.createPublisherSpan(
-      message,
-      this.topic.name
+    const span: Span = createSpan(
+      `${this.topic.name} send`,
+      SpanKind.PRODUCER,
+      spanAttributes
     );
 
-    // If the span's context is valid we should inject the propagation trace context.
+    // If the span's context is valid we should pass the span context special attribute
     if (isSpanContextValid(span.spanContext())) {
-      tracing.injectSpan(span, message, enabled);
+      if (
+        message.attributes &&
+        message.attributes['googclient_OpenTelemetrySpanContext']
+      ) {
+        console.warn(
+          'googclient_OpenTelemetrySpanContext key set as message attribute, but will be overridden.'
+        );
+      }
+      if (!message.attributes) {
+        message.attributes = {};
+      }
+
+      message.attributes['googclient_OpenTelemetrySpanContext'] =
+        JSON.stringify(span.spanContext());
     }
 
     return span;

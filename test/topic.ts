@@ -188,7 +188,7 @@ describe('Topic', () => {
     });
 
     it('should create an iam object', () => {
-      assert.deepStrictEqual(topic.iam.calledWith_, [PUBSUB, topic]);
+      assert.deepStrictEqual(topic.iam.calledWith_, [PUBSUB, TOPIC_NAME]);
     });
   });
 

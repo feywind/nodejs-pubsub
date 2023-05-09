@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import {EventEmitter} from 'events';
 import * as extend from 'extend';
 import {CallOptions} from 'google-gax';
 import snakeCase = require('lodash.snakecase');
@@ -41,14 +42,11 @@ import {
   SeekResponse,
   Snapshot,
 } from './snapshot';
-import {Message, Subscriber, SubscriberOptions} from './subscriber';
+import {Subscriber, SubscriberOptions} from './subscriber';
 import {Topic} from './topic';
 import {promisifySome} from './util';
 
 export {AckError, AckResponse, AckResponses} from './subscriber';
-
-import {EmitterCallback, WrappingEmitter} from './wrapping-emitter';
-import * as tracing from './telemetry-tracing';
 
 export type PushConfig = google.pubsub.v1.IPushConfig;
 export type OidcToken = google.pubsub.v1.PushConfig.IOidcToken;
@@ -268,27 +266,22 @@ export type DetachSubscriptionResponse = EmptyResponse;
  * });
  * ```
  */
-export class Subscription extends WrappingEmitter {
-  // Note: WrappingEmitter is used here to wrap user processing callbacks.
-  // We do this to be able to build telemetry spans around them.
+export class Subscription extends EventEmitter {
   pubsub: PubSub;
   iam: IAM;
+  name: string;
   topic?: Topic | string;
   metadata?: google.pubsub.v1.ISubscription;
   request: typeof PubSub.prototype.request;
-
   private _subscriber: Subscriber;
-
   constructor(pubsub: PubSub, name: string, options?: SubscriptionOptions) {
     super();
-
-    this.setEmitterWrapper(this.listenerWrapper.bind(this));
 
     options = options || {};
 
     this.pubsub = pubsub;
     this.request = pubsub.request.bind(pubsub);
-    this.id_ = name;
+    this.name = Subscription.formatName_(this.projectId, name);
     this.topic = options.topic;
 
     /**
@@ -329,7 +322,7 @@ export class Subscription extends WrappingEmitter {
      * });
      * ```
      */
-    this.iam = new IAM(pubsub, this);
+    this.iam = new IAM(pubsub, this.name);
 
     this._subscriber = new Subscriber(this, options);
     this._subscriber
@@ -339,43 +332,6 @@ export class Subscription extends WrappingEmitter {
       .on('close', () => this.emit('close'));
 
     this._listen();
-  }
-
-  private id_: string;
-  get name(): string {
-    return Subscription.formatName_(this.pubsub.projectId, this.id_);
-  }
-
-  /**
-   * This wrapper will be called as part of the emit() process. This lets
-   * us capture the full time span of processing even if the user is using
-   * async callbacks.
-   *
-   * @private
-   */
-  private listenerWrapper(
-    eventName: string | symbol,
-    listener: EmitterCallback,
-    args: unknown[]
-  ) {
-    if (eventName !== 'message') {
-      return listener(...args);
-    } else {
-      const span = tracing.SpanMaker.createReceiveProcessSpan(
-        args[0] as Message,
-        this.name
-      );
-
-      // If the user returned a Promise, that means they used an async handler.
-      // In that case, we need to tag on to their Promise to end the span.
-      // Otherwise, the listener chain is sync, and we can close out sync.
-      const result = listener(...args) as unknown as Promise<void>;
-      if (result && typeof result.then === 'function') {
-        result.then(() => span?.end());
-      } else {
-        span?.end();
-      }
-    }
   }
 
   /**
