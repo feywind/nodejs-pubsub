@@ -22,7 +22,6 @@ import {PublishError} from './publish-error';
 import {Publisher, PubsubMessage, PublishCallback} from './';
 import {google} from '../../protos/protos';
 
-import {filterMessage} from './pubsub-message';
 import {promisify} from 'util';
 
 /**
@@ -95,7 +94,7 @@ export abstract class MessageQueue extends EventEmitter {
     const {topic, settings} = this.publisher;
     const reqOpts = {
       topic: topic.name,
-      messages: messages.map(filterMessage),
+      messages,
     };
     if (messages.length === 0) {
       return;
