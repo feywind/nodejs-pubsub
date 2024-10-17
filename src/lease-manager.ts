@@ -18,6 +18,8 @@ import {EventEmitter} from 'events';
 import {AckError, Message, Subscriber} from './subscriber';
 import {defaultOptions} from './default-options';
 import {Duration} from './temporal';
+import {log as makeLog} from '@google-cloud/adhoc-logging';
+const log = makeLog('pubsub:leasing');
 
 export interface FlowControlOptions {
   allowExcessMessages?: boolean;
@@ -102,14 +104,18 @@ export class LeaseManager extends EventEmitter {
     const {allowExcessMessages} = this._options;
     const wasFull = this.isFull();
 
+    log.debug('adding message for leasing', message.id);
+
     this._messages.add(message);
     this.bytes += message.length;
 
     message.subSpans.flowStart();
 
     if (allowExcessMessages! || !wasFull) {
+      log.debug('dispensing message', message.id);
       this._dispense(message);
     } else {
+      log.debug('adding to pending', message.id);
       this._pending.push(message);
     }
 
@@ -163,6 +169,7 @@ export class LeaseManager extends EventEmitter {
    */
   remove(message: Message): void {
     if (!this._messages.has(message)) {
+      log.debug("don't have removed message", message.id);
       return;
     }
 
@@ -172,8 +179,10 @@ export class LeaseManager extends EventEmitter {
     this.bytes -= message.length;
 
     if (wasFull && !this.isFull()) {
+      log.debug('leasing inventory is empty');
       process.nextTick(() => this.emit('free'));
     } else if (this._pending.includes(message)) {
+      log.debug('message removed from pending', message.id);
       const index = this._pending.indexOf(message);
       this._pending.splice(index, 1);
     } else if (this.pending > 0) {
@@ -227,6 +236,8 @@ export class LeaseManager extends EventEmitter {
    * @private
    */
   private _cancelExtension(): void {
+    log.debug('cancelling leasing timer');
+
     this._isLeasing = false;
 
     if (this._timer) {
@@ -249,6 +260,7 @@ export class LeaseManager extends EventEmitter {
       message.subSpans.flowEnd();
       process.nextTick(() => {
         message.subSpans.processingStart(this._subscriber.name);
+        log.debug('dispensing message to user', message.id);
         this._subscriber.emit('message', message);
       });
     }
@@ -269,6 +281,7 @@ export class LeaseManager extends EventEmitter {
       if (lifespan < this._options.maxExtensionMinutes!) {
         const deadlineDuration = Duration.from({seconds: deadline});
         message.subSpans.modAckStart(deadlineDuration, false);
+        log.debug('extending deadline for', message.id, 'by', deadlineDuration);
 
         if (this._subscriber.isExactlyOnceDelivery) {
           message
@@ -287,6 +300,7 @@ export class LeaseManager extends EventEmitter {
           message.subSpans.modAckStart(deadlineDuration, false);
         }
       } else {
+        log.debug('message has expired', message.id);
         this.remove(message);
       }
     }
@@ -317,6 +331,7 @@ export class LeaseManager extends EventEmitter {
    */
   private _scheduleExtension(): void {
     const timeout = this._getNextExtensionTimeoutMs();
+    log.debug('scheduling leasing with timeout', timeout);
     this._timer = setTimeout(() => this._extendDeadlines(), timeout);
   }
 }

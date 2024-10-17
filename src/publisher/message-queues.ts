@@ -16,6 +16,8 @@
 
 import {ServiceError} from 'google-gax';
 import {EventEmitter} from 'events';
+import {log as makeLog} from '@google-cloud/adhoc-logging';
+const log = makeLog('pubsub:pub-queues');
 
 import {BatchPublishOptions, MessageBatch} from './message-batch';
 import {PublishError} from './publish-error';
@@ -184,9 +186,11 @@ export class Queue extends MessageQueue {
       // Make a background best-effort attempt to clear out the
       // queue. If this fails, we'll basically just be overloaded
       // for a bit.
+      log.debug('clearing backlog to make space');
       this.publish().catch(() => {});
     }
 
+    log.debug('adding', message.data, 'to unordered queue');
     this.batch.add(message, callback);
 
     if (this.batch.isFull()) {
@@ -231,6 +235,7 @@ export class Queue extends MessageQueue {
   async _publishInternal(fullyDrain: boolean): Promise<void> {
     const {messages, callbacks} = this.batch.end();
 
+    log.debug('sending unordered batch of', messages.length, 'messages');
     this.batch = new MessageBatch(this.batchOptions, this.publisher.topic.name);
 
     if (this.pending) {
@@ -310,6 +315,7 @@ export class OrderedQueue extends MessageQueue {
         this.batches.unshift(this.createBatch());
       }
 
+      log.debug('adding', message.data, 'to ordered queue', this.key);
       this.currentBatch.add(message, callback);
       return;
     }
@@ -318,6 +324,7 @@ export class OrderedQueue extends MessageQueue {
       // Make a best-effort attempt to clear out the publish queue,
       // to make more space for the new batch. If this fails, we'll
       // just be overfilled for a bit.
+      log.debug('clearing ordered queue', this.key);
       this.publish().catch(() => {});
     }
 
@@ -399,6 +406,12 @@ export class OrderedQueue extends MessageQueue {
     }
 
     const {messages, callbacks} = this.batches.pop()!.end();
+    log.debug(
+      'sending ordered batch of',
+      messages.length,
+      'messages on',
+      this.key
+    );
 
     try {
       await this._publish(messages, callbacks);
